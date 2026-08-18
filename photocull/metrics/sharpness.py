@@ -110,6 +110,7 @@ def measure(
     sharpness_map: SharpnessMap,
     subject: Box | None,
     sharp_fraction_threshold: float = 0.5,
+    min_background_acutance: float = 2.0,
 ) -> SharpnessMetrics:
     """Turn the map plus an optional subject box into the reported figures.
 
@@ -128,8 +129,16 @@ def measure(
         background_acutance = sharpness_map.outside(subject)
         # Guarded so an entirely smooth background (sky, studio backdrop) yields
         # a large finite ratio instead of an infinity that breaks JSON and sorts.
-        ratio = subject_acutance / max(background_acutance, 1e-6)
-        ratio = float(min(ratio, 999.0))
+        # A background with essentially no texture -- night sky, blank wall,
+        # blown-out overcast -- has nothing to compare against, and dividing by
+        # it produces a spectacular number that means nothing. A night shot with
+        # 1% of the frame in focus was scoring a ratio of 134 and sorting above
+        # every real photograph. Undefined is reported as undefined; the rules
+        # then fall through to measurements that still hold.
+        if background_acutance < min_background_acutance:
+            ratio = None
+        else:
+            ratio = float(min(subject_acutance / background_acutance, 999.0))
         # Subject acutance against the sharpest thing anywhere in the same frame.
         # Raw subject acutance is the peak over the tiles a box happens to cover,
         # so a box spanning half the frame collects a far higher number than a

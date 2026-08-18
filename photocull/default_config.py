@@ -49,6 +49,12 @@ sharp_fraction_threshold = 0.5
 # focus and set this just below its peak local value.
 sharp_acutance = 40.0
 
+# Background acutance below which subject_background_ratio is reported as
+# undefined rather than computed. A featureless background -- night sky, studio
+# backdrop, blown overcast -- gives the division nothing to work with, and the
+# resulting enormous ratio ranks empty frames above real photographs.
+min_background_acutance = 2.0
+
 [subject]
 # Detectors in preference order. The first that finds a subject wins, and the
 # report always records which one answered.

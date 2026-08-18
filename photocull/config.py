@@ -82,6 +82,7 @@ class SharpnessConfig:
     grid_long_edge: int = 24
     sharp_fraction_threshold: float = 0.5
     sharp_acutance: float = 40.0
+    min_background_acutance: float = 2.0
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "SharpnessConfig":
@@ -90,7 +91,11 @@ class SharpnessConfig:
         sharp = data.get("sharp_acutance", base.sharp_acutance)
         if not isinstance(sharp, (int, float)) or sharp <= 0:
             raise ConfigError(f"[sharpness].sharp_acutance must be positive, got {sharp!r}")
+        floor = data.get("min_background_acutance", base.min_background_acutance)
+        if not isinstance(floor, (int, float)) or floor < 0:
+            raise ConfigError(f"[sharpness].min_background_acutance must be >= 0, got {floor!r}")
         return cls(
+            min_background_acutance=float(floor),
             grid_long_edge=_positive(
                 "sharpness", "grid_long_edge", data.get("grid_long_edge", base.grid_long_edge)
             ),

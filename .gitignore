@@ -16,3 +16,4 @@ photocull-subjects.json
 *.jpeg
 *.nef
 *.NEF
+.gstack/

@@ -53,14 +53,20 @@ _PAGE = """<!doctype html>
   button.primary { background: var(--accent); color: #0d1117; border-color: var(--accent);
                    font-weight: 600; }
   label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 5px; }
-  main { padding: 16px; display: grid; gap: 14px;
+  main { padding: 16px; display: grid; gap: 14px; align-items: start;
          grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
           overflow: hidden; display: flex; flex-direction: column; }
   .card.best { border-color: var(--good); }
   .card.failed { opacity: .55; }
   .frame { position: relative; background: #0b0d10; cursor: zoom-in; }
-  .frame img { display: block; width: 100%; height: auto; }
+  .shot { position: relative; display: inline-block; line-height: 0; }
+  /* Fixed frame height so a portrait beside a landscape does not leave a
+     column of dead space. contain rather than cover: cropping the thumbnail
+     would move the subject box off the part of the picture it describes. */
+  .frame { height: 200px; display: flex; align-items: center; justify-content: center; }
+  .frame img { display: block; max-width: 100%; max-height: 100%;
+               width: auto; height: auto; }
   .box { position: absolute; border: 2px solid var(--accent); border-radius: 2px;
          box-shadow: 0 0 0 1px rgba(0,0,0,.55); pointer-events: none; }
   .focus { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px;
@@ -96,11 +102,11 @@ _PAGE = """<!doctype html>
   <div class="controls">
     <label>sort
       <select id="sort">
-        <option value="subject_or_max_acutance">subject sharpness</option>
-        <option value="max_local_acutance">peak sharpness</option>
-        <option value="subject_background_ratio">subject / background</option>
-        <option value="subject_relative_acutance">subject vs frame peak</option>
         <option value="rating">rating</option>
+        <option value="subject_background_ratio">subject / background</option>
+        <option value="max_local_acutance">peak sharpness</option>
+        <option value="subject_or_max_acutance">subject sharpness (box-size dependent)</option>
+        <option value="subject_relative_acutance">subject vs frame peak</option>
         <option value="sharp_fraction">depth of field</option>
         <option value="highlight_clipped">clipped highlights</option>
         <option value="group">group</option>
@@ -194,7 +200,12 @@ function visible() {
     const left = metric(a, key), right = metric(b, key);
     if (typeof left === "string" || typeof right === "string")
       return sign * String(left).localeCompare(String(right));
-    return sign * ((left ?? -Infinity) - (right ?? -Infinity));
+    const primary = sign * ((left ?? -Infinity) - (right ?? -Infinity));
+    if (primary !== 0) return primary;
+    // Equal on the chosen key (very common when sorting by rating): fall back to
+    // subject isolation so the best frame of a tie still surfaces first.
+    return sign * ((a.sharpness.subject_background_ratio ?? -Infinity)
+                 - (b.sharpness.subject_background_ratio ?? -Infinity));
   });
   return rows;
 }
@@ -214,8 +225,7 @@ function card(photo) {
 
   element.innerHTML = `
     <div class="frame" data-file="${photo.filename}">
-      ${photo.thumbnail ? `<img loading="lazy" src="${photo.thumbnail}" alt="">` : ""}
-      ${overlay}${focus}
+      ${photo.thumbnail ? `<span class="shot"><img loading="lazy" src="${photo.thumbnail}" alt="">${overlay}${focus}</span>` : ""}
       <div class="badge">${photo.detection.source}</div>
       ${groupBadge}
     </div>

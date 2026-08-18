@@ -125,7 +125,10 @@ class Analyzer:
 
         sharpness_map = sharpness.build_map(loaded.luma, config.sharpness.grid_long_edge)
         sharpness_metrics = sharpness.measure(
-            sharpness_map, detection.box, config.sharpness.sharp_fraction_threshold
+            sharpness_map,
+            detection.box,
+            config.sharpness.sharp_fraction_threshold,
+            config.sharpness.min_background_acutance,
         )
         exposure_metrics = exposure.measure(loaded.luma)
         blur_metrics = blur.measure(

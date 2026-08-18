@@ -122,6 +122,27 @@ class TestSharpness:
         metrics = sharpness.measure(sharpness.build_map(image), Box(0.45, 0.45, 0.10, 0.10))
         assert metrics.subject_relative_acutance < 0.5
 
+    def test_featureless_background_makes_the_ratio_undefined(self) -> None:
+        """A night sky or blank wall has no texture to compare against, so the
+        division is meaningless -- and a huge meaningless ratio sorts empty
+        frames above real photographs. Undefined must read as undefined."""
+        image = np.full((256, 256), 0.05, dtype=np.float32)  # near-black frame
+        image[112:144, 112:144] = checkerboard(32, 4)  # one small lit subject
+        metrics = sharpness.measure(
+            sharpness.build_map(image), Box(0.42, 0.42, 0.16, 0.16), min_background_acutance=2.0
+        )
+        assert metrics.subject_acutance > 0
+        assert metrics.subject_background_ratio is None
+
+    def test_textured_background_still_yields_a_ratio(self) -> None:
+        image = blurred(checkerboard(256, 4), passes=2)
+        image[112:144, 112:144] = checkerboard(32, 4)
+        metrics = sharpness.measure(
+            sharpness.build_map(image), Box(0.42, 0.42, 0.16, 0.16), min_background_acutance=2.0
+        )
+        assert metrics.subject_background_ratio is not None
+        assert metrics.subject_background_ratio > 1.0
+
     def test_grid_adapts_to_aspect_ratio(self) -> None:
         wide = sharpness.build_map(checkerboard(256)[:64, :], grid_long_edge=16)
         assert wide.tile_cols == 16
