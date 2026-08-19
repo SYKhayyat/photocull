@@ -214,10 +214,33 @@ def _closest(name: str, candidates: Sequence[str]) -> str | None:
     return matches[0] if matches else None
 
 
-class Rater:
-    """Applies an ordered rule set to reports. First matching rule wins."""
+def validate(rules: Sequence[Any], rank_by: str) -> None:
+    """Compile a rule set and a ranking expression, discarding the result.
 
-    def __init__(self, rules: Sequence[Any], known_names: Sequence[str]) -> None:
+    Called at config-load time, before a single file is opened. Compilation is
+    the validation -- :class:`Expression` raises on an unknown measurement -- so
+    this exists purely to make "before the run" a place in the code rather than
+    a promise in the README.
+    """
+    known = PhotoReport.flat_metric_names()
+    Expression(rank_by, known)
+    for rule in rules:
+        Expression(rule.when, known)
+
+
+class Rater:
+    """Applies an ordered rule set to reports.
+
+    First matching rule that awards stars wins. A rule with no ``stars`` is an
+    annotation: it attaches its reason, and its label if the deciding rule names
+    none, then lets the ladder continue. That distinction is what lets a
+    measurement be *reported* without being allowed to decide the frame's fate on
+    its own -- highlight clipping is the motivating case, and the exposure module
+    says so in as many words.
+    """
+
+    def __init__(self, rules: Sequence[Any], known_names: Sequence[str] | None = None) -> None:
+        known_names = list(known_names) if known_names is not None else PhotoReport.flat_metric_names()
         self._rules = list(rules)
         self._expressions = [Expression(rule.when, known_names) for rule in self._rules]
 
@@ -226,13 +249,24 @@ class Rater:
         from dataclasses import replace
 
         values = report.flat_metrics()
+        reasons = list(report.reasons)
+        # There is one colour label and it belongs to whichever rule decides the
+        # stars -- that is the verdict the photographer is reading. An annotation
+        # picked up on the way down contributes its colour only when the verdict
+        # names none, and always contributes its reason, which is where a flag
+        # like clipped highlights stays visible without overruling anything.
+        flagged = report.label
         for rule, expression in zip(self._rules, self._expressions):
-            if expression.matches(values):
-                reason = rule.reason or rule.when
-                return replace(
-                    report,
-                    rating=rule.stars,
-                    label=rule.label,
-                    reasons=(*report.reasons, reason),
-                )
-        return report
+            if not expression.matches(values):
+                continue
+            reasons.append(rule.reason or rule.when)
+            if rule.stars is None:
+                flagged = rule.label or flagged
+                continue  # an annotation, not a verdict
+            return replace(
+                report,
+                rating=rule.stars,
+                label=rule.label or flagged,
+                reasons=tuple(reasons),
+            )
+        return replace(report, label=flagged, reasons=tuple(reasons))

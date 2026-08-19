@@ -29,6 +29,15 @@ ZONES: Mapping[str, tuple[float, float, float, float]] = {
 }
 
 
+def _suffix_key(path: str | Path) -> str:
+    """Normalise a path, or a trailing piece of one, into a comparable key.
+
+    Slashes both ways and case both ways, because a sidecar written on one
+    machine is routinely read on another.
+    """
+    return "/".join(part.lower() for part in Path(path).parts)
+
+
 class ZoneDetector:
     """Assume the subject occupies a fixed region of the frame."""
 
@@ -61,7 +70,16 @@ class ManualDetector:
         {"DSC_2204.NEF": {"x": 0.41, "y": 0.22, "w": 0.18, "h": 0.24}}
 
     Keyed by filename rather than full path so the file survives the folder
-    being moved or renamed, which is the common case for a photo library.
+    being moved or renamed, which is the common case for a photo library. The
+    cost of that choice is real: two subfolders of one shoot can each hold a
+    ``DSC_0001.NEF``, and a bare filename cannot tell them apart. So a key may
+    also be any trailing run of path components::
+
+        {"2026-06-06/DSC_0001.NEF": {"x": 0.41, ...}}
+
+    The longest matching key wins, which leaves the portable bare name working
+    exactly as before and gives you a way to say which frame you meant when it
+    stops being enough.
     """
 
     name = "manual"
@@ -88,11 +106,26 @@ class ManualDetector:
 
         for key, value in raw.items():
             try:
-                self._boxes[Path(key).name] = Box(
+                self._boxes[_suffix_key(key)] = Box(
                     float(value["x"]), float(value["y"]), float(value["w"]), float(value["h"])
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise ConfigError(f"bad box for '{key}' in {self._sidecar}: {exc}") from exc
+
+    def _lookup(self, path: str) -> Box | None:
+        """Longest matching trailing run of path components wins.
+
+        A one-component key is the portable bare filename; a longer one is the
+        user saying which of two identically named frames they drew on. Trying
+        the most specific first means adding the disambiguating key does not
+        require removing the general one.
+        """
+        parts = Path(path).parts
+        for depth in range(min(len(parts), 8), 0, -1):
+            box = self._boxes.get(_suffix_key(Path(*parts[-depth:])))
+            if box is not None:
+                return box
+        return None
 
     def available(self) -> tuple[bool, str]:
         self._load()
@@ -102,7 +135,7 @@ class ManualDetector:
 
     def detect(self, context: DetectionContext) -> Detection:
         self._load()
-        box = self._boxes.get(Path(context.path).name)
+        box = self._lookup(context.path)
         if box is None:
             return not_found(self.name, "no hand-drawn box for this file")
         return Detection(

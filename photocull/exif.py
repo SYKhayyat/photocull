@@ -64,7 +64,11 @@ def from_tags(tags: dict[int, Any]) -> CaptureInfo:
     else:
         camera = " ".join(part for part in (make, model) if part) or None
 
+    # Panasonic writes no standard ISO tag in IFD0 and records it privately
+    # instead, so an RW2 would otherwise report no sensitivity at all.
     iso = tags.get(T.TAG_ISO)
+    if iso is None:
+        iso = tags.get(T.TAG_PANASONIC_ISO)
     if isinstance(iso, list) and iso:
         iso = iso[0]
 

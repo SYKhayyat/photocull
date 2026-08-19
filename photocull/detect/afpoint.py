@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..models import Box, Confidence, Detection
@@ -47,34 +48,90 @@ _FIELDS = (
 _BATCH_TIMEOUT_SECONDS = 300
 
 
+def _key(path: str | Path) -> str:
+    """The identity a box is filed under: the whole path, normalised.
+
+    Not the basename. A library is a tree, and in a tree two folders from one
+    shoot each holding a ``DSC_0001.NEF`` is the ordinary case rather than the
+    awkward one -- filing by basename would quietly apply one folder's focus
+    point to the other folder's frame. Lowercased and slash-normalised because
+    exiftool and pathlib disagree about separators on Windows, and because the
+    filesystem there does not distinguish case anyway.
+    """
+    try:
+        resolved = Path(path).resolve()
+    except OSError:  # a path that cannot be resolved is still a usable key
+        resolved = Path(path)
+    return resolved.as_posix().lower()
+
+
+@dataclass(frozen=True, slots=True)
+class AFScan:
+    """One tree-wide autofocus metadata pass, in a form that crosses processes.
+
+    Plain data on purpose -- a few hundred bytes per frame of floats and
+    strings -- so the parent can pass it to every worker through the pool's
+    initialiser instead of each worker recomputing it.
+    """
+
+    boxes: dict[str, Box]
+    reason: str = ""
+
+
 class AFPointDetector:
     """Subject box centred on the camera's selected autofocus area.
 
-    Metadata for the whole tree is fetched in a single exiftool invocation the
-    first time it is needed. Spawning one process per file would cost more than
-    the entire rest of the analysis on a session of any size.
+    Metadata for the whole tree is fetched in a single exiftool invocation,
+    because spawning one process per file would cost more than the entire rest of
+    the analysis on a session of any size.
+
+    "A single invocation" has to mean once per *run*, not once per object. The
+    analysis runs in a process pool, and a detector that scans lazily on its
+    first frame scans once in every worker -- eight recursive metadata passes
+    over the same folder, concurrently, contending for the same disk. So the
+    parent may run the scan itself and hand the result in through ``preloaded``;
+    the lazy path stays for the single-process callers, ``explain`` and
+    ``doctor``, where there is exactly one of these objects anyway.
     """
 
     name = "af-point"
 
-    def __init__(self, root: Path, box_fraction: float = 0.12) -> None:
+    def __init__(
+        self,
+        root: Path,
+        box_fraction: float = 0.12,
+        preloaded: "AFScan | None" = None,
+    ) -> None:
         self._root = Path(root)
         self._box_fraction = box_fraction
-        self._boxes: dict[str, Box] | None = None
-        self._reason = ""
+        self._boxes: dict[str, Box] | None = preloaded.boxes if preloaded else None
+        self._reason = preloaded.reason if preloaded else ""
+        self._by_name: dict[str, Box | None] | None = None
 
     def available(self) -> tuple[bool, str]:
-        if shutil.which("exiftool") is None:
+        if self._boxes is None and shutil.which("exiftool") is None:
             return False, "exiftool is not installed (needed to read autofocus maker-notes)"
         self._ensure_loaded()
         if not self._boxes:
             return False, self._reason or "no files carry autofocus coordinates"
         return True, ""
 
+    def scan(self) -> "AFScan":
+        """Run the metadata pass and return it, for a caller that will share it.
+
+        This is what makes hoisting possible: the parent process calls it once
+        before the pool exists, and every worker is constructed with the answer.
+        """
+        self._ensure_loaded()
+        return AFScan(dict(self._boxes or {}), self._reason)
+
     def _ensure_loaded(self) -> None:
         if self._boxes is not None:
             return
         self._boxes = {}
+        if shutil.which("exiftool") is None:
+            self._reason = "exiftool is not installed (needed to read autofocus maker-notes)"
+            return
 
         command = ["exiftool", "-j", "-n", "-q", "-r"]
         command += [f"-{field}" for field in _FIELDS]
@@ -103,10 +160,28 @@ class AFPointDetector:
         for record in records:
             box = self._box_from_record(record)
             if box is not None:
-                self._boxes[Path(record["SourceFile"]).name] = box
+                self._boxes[_key(record["SourceFile"])] = box
 
         if not self._boxes:
             self._reason = "no files in this tree record autofocus coordinates"
+
+    def _by_basename(self, name: str) -> Box | None:
+        """Last-resort lookup, and only when the basename is unambiguous.
+
+        exiftool reports the path it walked, which is not always spelled the way
+        the pipeline spells it -- a mapped drive, a symlink, a relative root. A
+        basename usually closes that gap. Where two frames in the tree share
+        one, it closes nothing and guessing between them would put the wrong
+        focus point on both, so the answer there is no answer.
+        """
+        assert self._boxes is not None
+        if self._by_name is None:
+            index: dict[str, Box | None] = {}
+            for key, box in self._boxes.items():
+                basename = Path(key).name
+                index[basename] = None if basename in index else box
+            self._by_name = index
+        return self._by_name.get(name.lower())
 
     def _box_from_record(self, record: dict) -> Box | None:
         """Turn one exiftool record into a normalised box, if it has coordinates."""
@@ -158,9 +233,20 @@ class AFPointDetector:
             return not_found(self.name, reason)
 
         assert self._boxes is not None
-        box = self._boxes.get(Path(context.path).name)
+        box = self._boxes.get(_key(context.path))
+        if box is None:
+            box = self._by_basename(Path(context.path).name)
         if box is None:
             return not_found(self.name, "no autofocus coordinates recorded for this frame")
+
+        # AFAreaXPosition and its siblings are sensor coordinates, normalised
+        # above against ExifImageWidth/Height which are sensor dimensions too.
+        # The luma this box is about to be measured against has already been
+        # rotated into viewing position, so on a portrait frame the two are a
+        # quarter turn apart. Turning the box is the difference between
+        # measuring where the camera focused and measuring somewhere else
+        # entirely, in the one figure the README singles out as trustworthy.
+        box = box.reoriented(context.orientation)
 
         return Detection(
             box=box,

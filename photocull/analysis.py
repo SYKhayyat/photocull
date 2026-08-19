@@ -18,7 +18,7 @@ from PIL import Image
 
 from . import exif
 from .config import Config
-from .detect import DetectionContext, SubjectDetector, build_chain
+from .detect import AFScan, DetectionContext, SubjectDetector, build_chain
 from .errors import PhotocullError
 from .grouping import difference_hash
 from .loading import LoaderRegistry, build_registry
@@ -71,6 +71,27 @@ def _failed_report(path: Path, message: str) -> PhotoReport:
     )
 
 
+def build_detector_chain(
+    config: Config, root: Path | None = None, af_scan: AFScan | None = None
+) -> SubjectDetector:
+    """Construct the subject chain a config asks for.
+
+    One place assembles these arguments, so the analyser, the parallel pipeline
+    and ``doctor`` cannot drift into building slightly different chains from the
+    same configuration file.
+    """
+    return build_chain(
+        config.subject.detectors,
+        root=root or Path.cwd(),
+        sidecar=Path(config.subject.sidecar),
+        zone=config.subject.zone,
+        prefer_eyes=config.subject.prefer_eyes,
+        face_score=config.subject.face_score,
+        face_min_size=config.subject.face_min_size,
+        af_scan=af_scan,
+    )
+
+
 class Analyzer:
     """Turns one file into one :class:`AnalysisResult`.
 
@@ -85,18 +106,11 @@ class Analyzer:
         registry: LoaderRegistry | None = None,
         detector: SubjectDetector | None = None,
         root: Path | None = None,
+        af_scan: AFScan | None = None,
     ) -> None:
         self._config = config
         self._registry = registry or build_registry(config.input.prefer_raw_decode)
-        self._detector = detector or build_chain(
-            config.subject.detectors,
-            root=root or Path.cwd(),
-            sidecar=Path(config.subject.sidecar),
-            zone=config.subject.zone,
-            prefer_eyes=config.subject.prefer_eyes,
-            face_score=config.subject.face_score,
-            face_min_size=config.subject.face_min_size,
-        )
+        self._detector = detector or build_detector_chain(config, root, af_scan)
 
     @property
     def detector(self) -> SubjectDetector:
@@ -116,10 +130,9 @@ class Analyzer:
 
         context = DetectionContext(
             luma=loaded.luma,
-            width=loaded.original_width,
-            height=loaded.original_height,
             path=str(path),
             directories=tuple(loaded.directories),
+            orientation=loaded.orientation,
         )
         detection = self._detector.detect(context)
 
@@ -130,7 +143,7 @@ class Analyzer:
             config.sharpness.sharp_fraction_threshold,
             config.sharpness.min_background_acutance,
         )
-        exposure_metrics = exposure.measure(loaded.luma)
+        exposure_metrics = exposure.measure(loaded.luma, config.exposure.percentile)
         blur_metrics = blur.measure(
             loaded.luma,
             sharpness_metrics.max_local_acutance,

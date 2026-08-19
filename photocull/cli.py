@@ -1,9 +1,10 @@
 """Command line interface.
 
-Four verbs, each doing one thing:
+Five verbs, each doing one thing:
 
 ``run``      analyse a folder and write reports
 ``explain``  analyse a single frame and print every number, for calibration
+``compare``  say what moved between two runs, which is the other half of that
 ``doctor``   say which detectors and loaders can actually run on this machine
 ``init``     write a commented config file you can start editing
 
@@ -24,14 +25,16 @@ from pathlib import Path
 from typing import Sequence
 
 from . import __version__
-from .analysis import Analyzer
+from .analysis import Analyzer, build_detector_chain
 from .config import DEFAULT_CONFIG_NAME, Config
 from .default_config import DEFAULT_CONFIG_TOML
-from .detect import DETECTOR_NAMES, build_chain
+from .detect import DETECTOR_NAMES
 from .errors import PhotocullError
 from .loading import PLAIN_SUFFIXES, RAW_SUFFIXES, build_registry
 from .outputs import WRITER_NAMES, build_writers
 from .pipeline import discover, run, summarise
+from .rating import Rater
+from .rating import validate as validate_rules
 
 
 def _progress(done: int, total: int, name: str) -> None:
@@ -43,6 +46,16 @@ def _progress(done: int, total: int, name: str) -> None:
     bar = "#" * filled + "." * (width - filled)
     sys.stderr.write(f"\r  [{bar}] {done}/{total}  {name[:34]:<34}")
     sys.stderr.flush()
+
+
+def _number(value: float | None, width: int = 8) -> str:
+    """Format a measurement that is allowed to be absent.
+
+    Half the interesting figures are undefined for some frames -- no subject
+    found, or a background with nothing to compare against -- and "undefined" is
+    a real answer this tool goes out of its way to report rather than fake.
+    """
+    return f"{value:{width}.2f}" if value is not None else f"{'-':>{width}}"
 
 
 def _load_config(args: argparse.Namespace, target: Path) -> Config:
@@ -69,6 +82,10 @@ def command_run(args: argparse.Namespace) -> int:
         from dataclasses import replace
 
         config = replace(config, grouping=replace(config.grouping, enabled=False))
+
+    # Before discovery, not after analysis: a typo'd measurement name should
+    # cost a millisecond, not the whole run.
+    validate_rules(config.rating.rules, config.rating.rank_by)
 
     files = discover(target, config)
     if not files:
@@ -112,9 +129,16 @@ def command_explain(args: argparse.Namespace) -> int:
     """Print every measurement for one frame, so thresholds can be calibrated."""
     target = Path(args.path).expanduser().resolve()
     config = _load_config(args, target)
+    validate_rules(config.rating.rules, config.rating.rank_by)
     analyzer = Analyzer(config, root=target.parent)
     result = analyzer.analyse(target, want_thumbnail=False)
     report = result.report
+
+    # The command exists to calibrate thresholds, and a calibration tool that
+    # prints every measurement without ever saying what the current thresholds
+    # made of them leaves the loop open. One call closes it.
+    if not report.error:
+        report = Rater(config.rating.rules).apply(report)
 
     if args.json:
         print(json.dumps(report.as_dict(include_tiles=True), indent=2, default=str))
@@ -135,9 +159,16 @@ def command_explain(args: argparse.Namespace) -> int:
     print(f"    peak local            {sharp.max_local_acutance:8.2f}")
     print(f"    frame mean            {sharp.global_acutance:8.2f}")
     if sharp.subject_acutance is not None:
-        print(f"    subject               {sharp.subject_acutance:8.2f}")
-        print(f"    background            {sharp.background_acutance:8.2f}")
-        print(f"    subject / background  {sharp.subject_background_ratio:8.2f}")
+        # Each of these is optional on its own. A subject can be measured while
+        # the ratio against it is refused: min_background_acutance declines to
+        # divide by a textureless background, which is exactly the case a night
+        # sky or a studio backdrop produces. Guarding only on subject_acutance
+        # crashed this command on any such frame.
+        print(f"    subject               {_number(sharp.subject_acutance)}")
+        print(f"    background            {_number(sharp.background_acutance)}")
+        print(f"    subject / background  {_number(sharp.subject_background_ratio)}")
+        if sharp.subject_background_ratio is None:
+            print("                          (background has too little texture to divide by)")
     print(f"    in focus              {sharp.sharp_fraction * 100:7.1f}%")
     print(f"    focus point           x={sharp.focus_x:.2f} y={sharp.focus_y:.2f}")
     print("  blur")
@@ -158,6 +189,39 @@ def command_explain(args: argparse.Namespace) -> int:
         if margin is not None:
             verdict = "safe" if margin >= 0 else "below the handholding rule"
             print(f"    shutter margin        {margin:+.1f} stops ({verdict})")
+
+    print("  verdict")
+    stars = "-" if report.rating is None else "*" * report.rating + "." * (5 - report.rating)
+    print(f"    rating                {stars}  ({report.rating if report.rating is not None else 'none'})")
+    print(f"    label                 {report.label or '-'}")
+    for reason in report.reasons:
+        print(f"    because               {reason}")
+    # Said plainly rather than left to be discovered. Half the default ladder
+    # asks about a frame's standing among its near-duplicates, and one frame has
+    # no near-duplicates by construction -- so those rules cannot fire here, and
+    # a rating from `explain` can legitimately differ from the same frame's
+    # rating in a full run.
+    if any("group" in rule.when for rule in config.rating.rules):
+        print("    note                  rules about groups cannot fire for a single frame;")
+        print("                          run the folder to see this frame ranked")
+    return 0
+
+
+def command_compare(args: argparse.Namespace) -> int:
+    """Say what moved between two runs, which is what calibration needs.
+
+    Deliberately takes the JSON reports rather than re-running anything. The
+    second half of a calibration loop is comparing a run you already did against
+    one you did an hour ago with a different threshold, and re-analysing eight
+    hundred frames to answer that would make the loop too slow to use.
+    """
+    from .compare import compare_files, format_comparison
+
+    result = compare_files(Path(args.before).expanduser(), Path(args.after).expanduser())
+    if args.json:
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        print(format_comparison(result, limit=args.limit))
     return 0
 
 
@@ -175,15 +239,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         print("    ! prefer_raw_decode is set but rawpy is not installed; using embedded previews")
 
     print("  detectors:")
-    chain = build_chain(
-        config.subject.detectors,
-        root=target,
-        sidecar=Path(config.subject.sidecar),
-        zone=config.subject.zone,
-        prefer_eyes=config.subject.prefer_eyes,
-        face_score=config.subject.face_score,
-        face_min_size=config.subject.face_min_size,
-    )
+    chain = build_detector_chain(config, root=target)
     usable_any = False
     for name, usable, reason in chain.availability_report():
         mark = "ok " if usable else "-- "
@@ -256,6 +312,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_config_flags(explain_parser)
     explain_parser.add_argument("--json", action="store_true", help="emit the full record as JSON")
     explain_parser.set_defaults(handler=command_explain)
+
+    compare_parser = sub.add_parser("compare", help="say what changed between two runs")
+    compare_parser.add_argument("before", help="the earlier photocull.json")
+    compare_parser.add_argument("after", help="the later photocull.json")
+    compare_parser.add_argument("--json", action="store_true", help="emit the comparison as JSON")
+    compare_parser.add_argument("--limit", type=int, default=20,
+                                help="how many changed frames to list (default: 20)")
+    compare_parser.set_defaults(handler=command_compare)
 
     doctor_parser = sub.add_parser("doctor", help="report which capabilities are available here")
     doctor_parser.add_argument("path", nargs="?", help="folder the run would target")

@@ -20,9 +20,15 @@ _CLIP_MARGIN = 2.0 / 255.0
 def measure(luma: np.ndarray, percentile: float = 0.5) -> ExposureMetrics:
     """Measure tonal health of a normalised luma image (float, 0..1).
 
-    ``dynamic_range`` and ``contrast`` are both taken from percentiles rather
-    than min/max: a single hot pixel or one specular highlight should not define
-    the tonal range of an entire photograph.
+    ``dynamic_range`` is taken from percentiles rather than min/max: a single
+    hot pixel or one specular highlight should not define the tonal range of an
+    entire photograph. How far in to sample is ``[exposure].percentile`` in the
+    config file -- reachable, rather than a parameter only this docstring knew
+    about.
+
+    Clipping is deliberately not measured through it. A clipped pixel is one at
+    the end of the range, so moving the sample inwards would measure something
+    else and go on calling it clipping.
     """
     if luma.size == 0:
         return ExposureMetrics(0.0, 0.0, 0.0, 0.0, 0.0)

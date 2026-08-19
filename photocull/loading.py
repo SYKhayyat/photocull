@@ -34,7 +34,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from .errors import UnreadableImage
-from .tiffreader import TiffDirectory, find_largest_preview, read_preview_bytes
+from .tiffreader import TiffDirectory, find_largest_preview, frame_size, read_preview_bytes
 
 # Rec. 709 luma weights. Matching how a viewer perceives brightness matters
 # because a channel-average turns a red subject on green foliage into mush and
@@ -64,6 +64,11 @@ class LoadedImage:
     original_width: int
     original_height: int
     loader: str
+    # The EXIF orientation as the file stores it, kept even though ``luma`` has
+    # already been rotated to match. Autofocus coordinates are recorded in
+    # unrotated sensor space, so placing that box on the rotated luma needs to
+    # know which way round the file was.
+    orientation: int | None = None
     directories: Sequence[TiffDirectory] = field(default_factory=tuple)
     exif: dict[int, object] = field(default_factory=dict)
 
@@ -88,6 +93,112 @@ def _make_thumbnail(image: Image.Image, edge: int) -> Image.Image:
     thumb = image.convert("RGB").copy()
     thumb.thumbnail((edge, edge), Image.Resampling.BOX)
     return thumb
+
+
+# EXIF tag numbers spelled out here rather than imported from tiffreader,
+# because this path talks to Pillow's mapping rather than to a parsed TIFF tree.
+_TAG_ORIENTATION = 0x0112
+_TAG_EXIF_IFD = 0x8769
+_TAG_GPS_IFD = 0x8825
+
+# Orientations 5-8 all involve a quarter turn, so for those the stored pixel
+# dimensions describe the frame with its sides swapped relative to how it is
+# viewed -- and viewed is how everything downstream measures it.
+_TRANSPOSING_ORIENTATIONS = frozenset({5, 6, 7, 8})
+
+
+def _flat_exif(image: Image.Image) -> dict[int, object]:
+    """Pillow's EXIF with the sub-IFDs merged in.
+
+    ``getexif()`` returns IFD0 alone, and IFD0 holds almost nothing this tool
+    wants: shutter speed, aperture, ISO, capture time, focal length and lens
+    name all live in the Exif sub-IFD that tag 0x8769 points at. Without
+    following that pointer a JPEG reports a camera name and nothing else, which
+    silently disables the handholding-rule figure, ``explain``'s capture block
+    and time-gap grouping -- a documented knob that works on raw files and
+    quietly does nothing on JPEGs is worse than one that does not exist.
+
+    Flattened into one mapping because that is the shape ``exif.extract``
+    already reduces parsed raw directories to. Both sources then merge the same
+    way and nothing downstream has to know which kind of file it came from.
+    """
+    try:
+        source = image.getexif()
+    except Exception:  # a truncated or malformed APP1 segment is not fatal
+        return {}
+    merged: dict[int, object] = dict(source)
+    for pointer in (_TAG_EXIF_IFD, _TAG_GPS_IFD):
+        try:
+            sub = source.get_ifd(pointer)
+        except Exception:
+            continue
+        # setdefault, not update: IFD0's camera identity must not be overwritten
+        # by a sub-directory that happens to reuse a tag number. Same rule
+        # exif._merge applies to raw directories.
+        for tag, value in sub.items():
+            merged.setdefault(tag, value)
+    # The pointers themselves are file offsets, not measurements.
+    for pointer in (_TAG_EXIF_IFD, _TAG_GPS_IFD):
+        merged.pop(pointer, None)
+    return merged
+
+
+def _orientation_value(value: object) -> int | None:
+    if isinstance(value, (list, tuple)) and value:
+        value = value[0]
+    if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 8:
+        return value
+    return None
+
+
+def _orientation_of(exif: dict[int, object]) -> int | None:
+    return _orientation_value(exif.get(_TAG_ORIENTATION))
+
+
+def _orientation_from_directories(directories: Sequence[TiffDirectory]) -> int | None:
+    for directory in directories:
+        found = _orientation_value(directory.get(_TAG_ORIENTATION))
+        if found is not None:
+            return found
+    return None
+
+
+# Orientation value to the transposition that turns stored pixels into viewed
+# ones. The same table ``ImageOps.exif_transpose`` uses; spelled out because the
+# raw path has to apply it from a tag Pillow cannot see.
+_TRANSPOSITIONS = {
+    2: Image.Transpose.FLIP_LEFT_RIGHT,
+    3: Image.Transpose.ROTATE_180,
+    4: Image.Transpose.FLIP_TOP_BOTTOM,
+    5: Image.Transpose.TRANSPOSE,
+    6: Image.Transpose.ROTATE_270,
+    7: Image.Transpose.TRANSVERSE,
+    8: Image.Transpose.ROTATE_90,
+}
+
+
+def _apply_orientation(image: Image.Image, orientation: int | None) -> Image.Image:
+    """Rotate stored pixels into viewing position, from an explicit value.
+
+    ``ImageOps.exif_transpose`` reads the tag off the image, which is no use
+    when the orientation was recorded in the raw container rather than in the
+    embedded preview we just decoded.
+    """
+    operation = _TRANSPOSITIONS.get(orientation or 1)
+    return image.transpose(operation) if operation is not None else image
+
+
+def _viewed_size(width: int, height: int, orientation: int | None) -> tuple[int, int]:
+    """Stored dimensions restated as the photograph is actually seen.
+
+    The luma every metric runs on has been through ``exif_transpose``. Reporting
+    the stored dimensions beside it would describe a landscape frame whose
+    analysis ran on a portrait one -- wrong in the CSV, the JSON and the header
+    line of ``explain``.
+    """
+    if orientation in _TRANSPOSING_ORIENTATIONS:
+        return height, width
+    return width, height
 
 
 @runtime_checkable
@@ -120,14 +231,21 @@ class PlainImageLoader:
                 # dramatically cheaper than decoding full size and then
                 # discarding most of the pixels.
                 image.draft("RGB", (working_edge, working_edge))
+                # Read before the transpose, which drops the Orientation tag
+                # from the image it returns -- right for the pixels, and it
+                # would take with it the one tag still needed here.
+                exif = _flat_exif(image)
+                orientation = _orientation_of(exif)
                 image = ImageOps.exif_transpose(image) or image
-                exif = dict(image.getexif())
                 luma = _to_luma(image, working_edge)
                 thumbnail = _make_thumbnail(image, thumbnail_edge)
         except (OSError, ValueError) as exc:
             raise UnreadableImage(f"{path.name}: {exc}") from exc
 
-        return LoadedImage(path, luma, thumbnail, width, height, self.name, exif=exif)
+        width, height = _viewed_size(width, height, orientation)
+        return LoadedImage(
+            path, luma, thumbnail, width, height, self.name, exif=exif, orientation=orientation
+        )
 
 
 class RawPreviewLoader:
@@ -146,18 +264,44 @@ class RawPreviewLoader:
         if location is None:
             raise UnreadableImage(f"{path.name}: no embedded preview found")
 
+        # Bodies differ over whether the embedded preview repeats the
+        # orientation tag. Where it does not, the container's IFD0 still holds
+        # it, and a portrait frame would otherwise be measured, thumbnailed and
+        # reported on its side.
+        container_orientation = _orientation_from_directories(directories)
         try:
             payload = read_preview_bytes(path, location)
             with Image.open(io.BytesIO(payload)) as image:
                 width, height = image.size
                 image.draft("RGB", (working_edge, working_edge))
-                image = ImageOps.exif_transpose(image) or image
+                orientation = _orientation_of(_flat_exif(image))
+                if orientation is None:
+                    orientation = container_orientation
+                image = _apply_orientation(image, orientation)
                 luma = _to_luma(image, working_edge)
                 thumbnail = _make_thumbnail(image, thumbnail_edge)
         except (OSError, ValueError) as exc:
             raise UnreadableImage(f"{path.name}: preview would not decode ({exc})") from exc
 
-        return LoadedImage(path, luma, thumbnail, width, height, self.name, directories=directories)
+        # The preview is not always the full frame, and the report's dimensions
+        # are meant to describe the photograph, not the JPEG we happened to read.
+        declared = frame_size(path, directories)
+        if declared and declared[0] * declared[1] > width * height:
+            width, height = declared
+
+        # Both the preview's size and the declared frame size are recorded in
+        # sensor orientation, so the swap applies to whichever of them won.
+        width, height = _viewed_size(width, height, orientation)
+        return LoadedImage(
+            path,
+            luma,
+            thumbnail,
+            width,
+            height,
+            self.name,
+            directories=directories,
+            orientation=orientation,
+        )
 
 
 class RawDecodeLoader:
@@ -199,8 +343,19 @@ class RawDecodeLoader:
             _, directories = find_largest_preview(path)
         except (OSError, ValueError):
             directories = []
+        # rawpy honours the camera's flip while postprocessing, so these
+        # dimensions already describe the viewed frame and must not be swapped a
+        # second time. The orientation is still recorded, because autofocus
+        # coordinates are sensor-space whichever loader produced the pixels.
         return LoadedImage(
-            path, luma, thumbnail, width * 2, height * 2, self.name, directories=directories
+            path,
+            luma,
+            thumbnail,
+            width * 2,
+            height * 2,
+            self.name,
+            directories=directories,
+            orientation=_orientation_from_directories(directories),
         )
 
 

@@ -15,8 +15,9 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-from .analysis import Analyzer
+from .analysis import Analyzer, build_detector_chain
 from .config import Config
+from .detect import AFPointDetector, AFScan
 from .errors import ConfigError
 from .grouping import group_by_similarity
 from .loading import PLAIN_SUFFIXES, RAW_SUFFIXES
@@ -31,20 +32,19 @@ _WORKER: Analyzer | None = None
 ProgressCallback = Callable[[int, int, str], None]
 
 
-def _init_worker(config: Config, root: str) -> None:
+def _init_worker(config: Config, root: str, af_scan: AFScan | None) -> None:
     global _WORKER
-    _WORKER = Analyzer(config, root=Path(root))
+    _WORKER = Analyzer(config, root=Path(root), af_scan=af_scan)
 
 
-def _analyse_one(path_text: str) -> tuple[PhotoReport, bytes | None, int]:
+def _analyse_one(path_text: str) -> tuple[PhotoReport, bytes | None]:
     assert _WORKER is not None, "worker was not initialised"
     result = _WORKER.analyse(Path(path_text))
     fingerprint = result.fingerprint
     # Hashes cross the process boundary as bytes: small, and it avoids pickling
-    # a NumPy array for every single file.
-    return result.report, (fingerprint.tobytes() if fingerprint is not None else None), (
-        len(fingerprint) if fingerprint is not None else 0
-    )
+    # a NumPy array for every single file. The length used to ride along too and
+    # nothing read it -- np.frombuffer takes it from the buffer.
+    return result.report, (fingerprint.tobytes() if fingerprint is not None else None)
 
 
 def discover(root: Path, config: Config) -> list[Path]:
@@ -66,8 +66,9 @@ def discover(root: Path, config: Config) -> list[Path]:
 
 def _rank_within_groups(reports: list[PhotoReport], rank_by: str) -> list[PhotoReport]:
     """Order each group best-first and record every frame's rank in it."""
-    known = set(reports[0].flat_metrics()) if reports else set()
-    expression = Expression(rank_by, sorted(known))
+    # The canonical name set, not one scraped off reports[0]: an empty run
+    # must reject a bad expression exactly the way a full one does.
+    expression = Expression(rank_by, PhotoReport.flat_metric_names())
 
     # Keyed by (has_group, id) so an ungrouped frame -- which becomes a group of
     # one keyed by its own index -- can never collide with real group 0.
@@ -86,6 +87,17 @@ def _rank_within_groups(reports: list[PhotoReport], rank_by: str) -> list[PhotoR
         for rank, index in enumerate(ordered):
             ranked[index] = replace(ranked[index], group_rank=rank, group_size=len(indices))
     return ranked
+
+
+def _scan_autofocus(root: Path, config: Config) -> AFScan | None:
+    """Do the tree-wide autofocus metadata pass once, in the parent.
+
+    ``None`` when the chain does not include the detector, so a run that never
+    wanted autofocus data never pays for it.
+    """
+    if "af-point" not in config.subject.detectors:
+        return None
+    return AFPointDetector(root).scan()
 
 
 def run(
@@ -114,11 +126,34 @@ def run(
             if progress:
                 progress(index, len(paths), path.name)
     else:
+        # The autofocus detector reads the whole tree's maker-notes in one
+        # exiftool call, on the correct reasoning that one process per file
+        # would cost more than the analysis. That batching only holds if the
+        # batch runs once: left to itself each worker would run its own on its
+        # first frame, turning one recursive scan into eight concurrent ones
+        # over the same disk. So it happens here, before the pool exists, and
+        # the result -- a small dict of filenames to boxes -- rides in through
+        # the initialiser.
+        af_scan = _scan_autofocus(root, config)
+
+        # Built here and thrown away. Every worker builds its own -- they are
+        # processes and a loaded cascade does not pickle -- but if construction
+        # is going to fail it must fail *here*, in a process that can still
+        # print a sentence. Inside the initialiser the same ConfigError is a
+        # worker dying on startup, which the pool reports as
+        # BrokenProcessPool and which says nothing at all about the config file
+        # that caused it. Validating the two known values in config.py covers
+        # today's mistakes; constructing the chain covers the ones a future
+        # detector will invent.
+        build_detector_chain(config, root, af_scan)
+
         with ProcessPoolExecutor(
-            max_workers=worker_count, initializer=_init_worker, initargs=(config, str(root))
+            max_workers=worker_count,
+            initializer=_init_worker,
+            initargs=(config, str(root), af_scan),
         ) as pool:
             stream = pool.map(_analyse_one, [str(p) for p in paths], chunksize=4)
-            for index, (report, raw_hash, length) in enumerate(stream, start=1):
+            for index, (report, raw_hash) in enumerate(stream, start=1):
                 reports.append(report)
                 fingerprints.append(
                     np.frombuffer(raw_hash, dtype=np.uint8) if raw_hash else None
@@ -140,7 +175,7 @@ def run(
 
     reports = _rank_within_groups(reports, config.rating.rank_by)
 
-    rater = Rater(config.rating.rules, sorted(reports[0].flat_metrics()))
+    rater = Rater(config.rating.rules)
     return [rater.apply(report) for report in reports]
 
 

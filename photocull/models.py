@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field
+from dataclasses import fields as dataclass_fields
 from enum import Enum
 from typing import Any, Sequence
 
@@ -62,12 +63,50 @@ class Box:
         bottom = max(top + 1, int(round((c.y + c.h) * height)))
         return left, top, min(right, width), min(bottom, height)
 
+    def reoriented(self, orientation: int | None) -> "Box":
+        """Map a box from stored/sensor coordinates into viewing coordinates.
+
+        Autofocus metadata records where the camera focused in sensor
+        coordinates, and normalises against the sensor's own dimensions. The
+        luma every metric runs on has been rotated into viewing position first.
+        On a portrait frame those two disagree by ninety degrees, which would
+        put the box on the wrong part of the picture in exactly the one
+        measurement this tool asks you to trust most.
+
+        Normalised coordinates make the quarter turns free: the frame's aspect
+        ratio changes with it, so the unit square maps onto the unit square.
+        """
+        if not orientation or orientation == 1:
+            return self
+        corners = ((self.x, self.y), (self.x + self.w, self.y + self.h))
+        moved = [_ORIENT_POINT[orientation](x, y) for x, y in corners]
+        left = min(point[0] for point in moved)
+        top = min(point[1] for point in moved)
+        right = max(point[0] for point in moved)
+        bottom = max(point[1] for point in moved)
+        return Box(left, top, max(right - left, 1e-6), max(bottom - top, 1e-6)).clipped()
+
     @property
     def area(self) -> float:
         return self.w * self.h
 
     def as_dict(self) -> dict[str, float]:
         return {"x": self.x, "y": self.y, "w": self.w, "h": self.h}
+
+
+# Where a stored point lands once the EXIF orientation has been applied, in
+# normalised coordinates. Orientation 1 is the identity and is handled before
+# the lookup. The turns match Pillow's own exif_transpose table: 6 is a quarter
+# turn clockwise, so the stored top-left corner becomes the viewed top-right.
+_ORIENT_POINT = {
+    2: lambda x, y: (1.0 - x, y),
+    3: lambda x, y: (1.0 - x, 1.0 - y),
+    4: lambda x, y: (x, 1.0 - y),
+    5: lambda x, y: (y, x),
+    6: lambda x, y: (1.0 - y, x),
+    7: lambda x, y: (1.0 - y, 1.0 - x),
+    8: lambda x, y: (y, 1.0 - x),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,6 +308,26 @@ class CaptureInfo:
         return data
 
 
+# The parts of ``PhotoReport.flat_metrics`` that are not simply the fields of a
+# nested metrics dataclass. Kept beside the method that produces them so the
+# two are edited together.
+_FLAT_SCALARS = (
+    "filename",
+    "width",
+    "height",
+    "group_id",
+    "group_rank",
+    "group_size",
+    "is_group_best",
+    "subject_source",
+    "subject_found",
+    "subject_confidence",
+)
+
+# Computed properties that ride along with the dataclass fields.
+_FLAT_DERIVED = ("reciprocal_margin", "subject_or_max_acutance")
+
+
 @dataclass(frozen=True, slots=True)
 class PhotoReport:
     """The complete record for one photograph.
@@ -328,6 +387,22 @@ class PhotoReport:
         if include_thumb and self.thumbnail_uri:
             data["thumbnail"] = self.thumbnail_uri
         return data
+
+    @classmethod
+    def flat_metric_names(cls) -> list[str]:
+        """Every name :meth:`flat_metrics` can produce, sorted.
+
+        Derived from the *shape* of the report rather than from an instance,
+        because rule validation must happen before any photograph is read. A
+        test asserts this stays in step with :meth:`flat_metrics`; if the two
+        ever drift, the config error messages would start lying, which is the
+        one thing the rating module exists to prevent.
+        """
+        names = set(_FLAT_SCALARS)
+        for metrics in (SharpnessMetrics, ExposureMetrics, BlurMetrics, CaptureInfo):
+            names.update(f.name for f in dataclass_fields(metrics))
+        names.update(_FLAT_DERIVED)
+        return sorted(names)
 
     def flat_metrics(self) -> dict[str, Any]:
         """A single flat namespace for rating expressions and CSV columns.

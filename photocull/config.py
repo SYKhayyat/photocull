@@ -27,6 +27,11 @@ def _check_keys(section: str, data: Mapping[str, Any], allowed: Sequence[str]) -
     A silently ignored typo in a config file is the worst kind of bug: the tool
     runs, reports success, and obeys a setting you did not write.
     """
+    # A section that is not a table at all -- ``input = 5`` -- would otherwise
+    # fail on ``set(data)`` with a TypeError, which main() does not catch and
+    # which names neither the section nor the value.
+    if not isinstance(data, Mapping):
+        raise ConfigError(f"[{section}] must be a table, got {data!r}")
     unknown = sorted(set(data) - set(allowed))
     if unknown:
         raise ConfigError(
@@ -45,6 +50,29 @@ def _fraction(section: str, name: str, value: Any) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0.0 <= value <= 1.0:
         raise ConfigError(f"[{section}].{name} must be between 0 and 1, got {value!r}")
     return float(value)
+
+
+def _suffixes(value: Any) -> tuple[str, ...]:
+    """Normalise a list of file extensions, leading dot optional.
+
+    Every other malformed value in this module produces a ConfigError naming the
+    section, the key and the offending value. A non-string in here used to
+    escape as a bare AttributeError from ``str.startswith``, which main() does
+    not catch, so a one-character config mistake surfaced as a traceback.
+    """
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError(f"[input].include_suffixes must be a list of extensions, got {value!r}")
+    suffixes: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str) or not entry.strip(". "):
+            raise ConfigError(
+                f"[input].include_suffixes must contain extensions like '.nef', got {entry!r}"
+            )
+        cleaned = entry.strip().lower()
+        suffixes.append(cleaned if cleaned.startswith(".") else f".{cleaned}")
+    return tuple(suffixes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,10 +96,7 @@ class InputConfig:
             ),
             recursive=bool(data.get("recursive", base.recursive)),
             prefer_raw_decode=bool(data.get("prefer_raw_decode", base.prefer_raw_decode)),
-            include_suffixes=tuple(
-                s.lower() if s.startswith(".") else f".{s.lower()}"
-                for s in data.get("include_suffixes", base.include_suffixes)
-            ),
+            include_suffixes=_suffixes(data.get("include_suffixes", base.include_suffixes)),
         )
 
 
@@ -109,6 +134,32 @@ class SharpnessConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ExposureConfig:
+    """Where the tonal range is sampled from.
+
+    ``dynamic_range`` and the tonal spread are taken from percentiles rather
+    than from the extremes, so that one hot pixel or a single specular highlight
+    does not define the range of a whole photograph. How far in to move is a
+    real judgement -- 0.5 ignores the extreme half-percent at each end, higher
+    values ignore more -- and it was reachable only by editing the source until
+    this section existed.
+    """
+
+    percentile: float = 0.5
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ExposureConfig":
+        _check_keys("exposure", data, [f.name for f in cls.__dataclass_fields__.values()])
+        base = cls()
+        value = data.get("percentile", base.percentile)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0.0 <= value < 50.0:
+            raise ConfigError(
+                f"[exposure].percentile must be at least 0 and below 50, got {value!r}"
+            )
+        return cls(percentile=float(value))
+
+
+@dataclass(frozen=True, slots=True)
 class SubjectConfig:
     """Which detectors to use, in which order."""
 
@@ -128,9 +179,29 @@ class SubjectConfig:
             detectors = [detectors]
         if not isinstance(detectors, (list, tuple)) or not detectors:
             raise ConfigError("[subject].detectors must be a non-empty list of names")
+
+        # Values, not just keys. _check_keys exists so a typo cannot be silently
+        # obeyed; a typo in a *value* was still reaching build_chain, which on
+        # the parallel path runs first inside the pool initialiser -- so a
+        # misspelt zone came back as a BrokenProcessPool traceback at the
+        # default worker count and as a clear sentence at -j1.
+        from .detect import DETECTOR_NAMES
+        from .detect.simple import ZONES
+
+        names = tuple(str(name) for name in detectors)
+        for name in names:
+            if name not in DETECTOR_NAMES:
+                raise ConfigError(
+                    f"[subject].detectors has unknown detector '{name}'; "
+                    f"known: {', '.join(DETECTOR_NAMES)}"
+                )
+        zone = str(data.get("zone", base.zone))
+        if zone not in ZONES:
+            raise ConfigError(f"[subject].zone is unknown: '{zone}'; choose from {sorted(ZONES)}")
+
         return cls(
-            detectors=tuple(str(name) for name in detectors),
-            zone=str(data.get("zone", base.zone)),
+            detectors=names,
+            zone=zone,
             prefer_eyes=bool(data.get("prefer_eyes", base.prefer_eyes)),
             sidecar=str(data.get("sidecar", base.sidecar)),
             face_score=_fraction("subject", "face_score", data.get("face_score", base.face_score)),
@@ -226,6 +297,15 @@ class OutputConfig:
     include_tile_map: bool = False
     write_xmp_next_to_originals: bool = False
     open_html: bool = False
+    # Above this many frames the contact sheet stops inlining its thumbnails and
+    # writes them to a sibling folder instead. The single-file page is the whole
+    # point of the format -- it opens off a USB stick in five years with no
+    # server and no asset folder -- and it stays the default. But a thumbnail is
+    # about 22 KB of base64, so a wedding at five thousand frames is a 113 MB
+    # HTML file, and "portable" stops being true some way before "impossible".
+    # A threshold rather than a flag, because the user this design protects is
+    # exactly the one who does not read config files.
+    self_contained_max_frames: int = 1500
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "OutputConfig":
@@ -244,6 +324,11 @@ class OutputConfig:
                 data.get("write_xmp_next_to_originals", base.write_xmp_next_to_originals)
             ),
             open_html=bool(data.get("open_html", base.open_html)),
+            self_contained_max_frames=_positive(
+                "output",
+                "self_contained_max_frames",
+                data.get("self_contained_max_frames", base.self_contained_max_frames),
+            ),
         )
 
 
@@ -253,6 +338,7 @@ class Config:
 
     input: InputConfig = field(default_factory=InputConfig)
     sharpness: SharpnessConfig = field(default_factory=SharpnessConfig)
+    exposure: ExposureConfig = field(default_factory=ExposureConfig)
     subject: SubjectConfig = field(default_factory=SubjectConfig)
     grouping: GroupingConfig = field(default_factory=GroupingConfig)
     rating: RatingConfig = field(default_factory=lambda: RatingConfig(rules=DEFAULT_RULES))
@@ -264,7 +350,7 @@ class Config:
         _check_keys(
             "top level",
             data,
-            ["input", "sharpness", "subject", "grouping", "rating", "output"],
+            ["input", "sharpness", "exposure", "subject", "grouping", "rating", "output"],
         )
         rating_data = data.get("rating", {})
         rating = RatingConfig.from_dict(rating_data) if rating_data else RatingConfig(rules=DEFAULT_RULES)
@@ -273,6 +359,7 @@ class Config:
         return cls(
             input=InputConfig.from_dict(data.get("input", {})),
             sharpness=SharpnessConfig.from_dict(data.get("sharpness", {})),
+            exposure=ExposureConfig.from_dict(data.get("exposure", {})),
             subject=SubjectConfig.from_dict(data.get("subject", {})),
             grouping=GroupingConfig.from_dict(data.get("grouping", {})),
             rating=rating,
@@ -303,10 +390,47 @@ class Config:
         return cls()
 
 
-# The default rules deliberately never award five stars on sharpness alone: a
-# perfectly focused frame with blown highlights is not a keeper, and a rule set
-# that says otherwise trains you to ignore it.
+# Two kinds of comparison live in this file, and keeping them apart is the whole
+# design of the default ladder.
+#
+# Within a near-duplicate group -- same subject, same light, same framing --
+# comparison is reliable, and so is subject-versus-background inside a single
+# frame. Absolute thresholds across a whole library are not: what counts as
+# "sharp" moves with content, lens and subject matter, which is why the README
+# has a section explaining that the numbers are not absolutely comparable.
+#
+# There is a third trap underneath that one, and it is the reason these rules
+# ask about `subject_confidence`. A subject-versus-background figure is only
+# evidence about focus when the subject was located *independently of sharpness*.
+# The saliency detector finds the subject by looking for the region of highest
+# local contrast -- which is very nearly the same thing the sharpness map
+# measures -- so asking "is the subject sharper than its background" about a
+# saliency box is asking whether saliency worked, not whether focus landed. On a
+# real 835-frame library the median subject/background ratio was 3.44 for
+# detected faces and 6.92 for saliency boxes, and the relative acutance figure
+# was 1.000 at the median for saliency: perfectly circular. So the verdicts that
+# rest on the subject require a subject somebody other than the sharpness pass
+# picked -- manual, autofocus metadata, or a detected face.
+#
+# Everything else falls through to group rank, which is independent of all of it.
+#
+# Rules with no ``stars`` are annotations: they attach a label and a reason and
+# let the ladder continue. Highlight clipping is one, deliberately. The exposure
+# module says of it "Reported, never scored ... that is the photographer's call,
+# not this tool's", and a rule set that rejected a backlit portrait over a blown
+# rim light would be contradicting that in the only place it matters.
+
+# Confidence levels meaning "something other than the sharpness map put the box
+# here". Written out rather than negating "low" because a frame with no subject
+# at all reports "none", and that must not count as independent evidence.
+_INDEPENDENT_SUBJECT = 'subject_confidence in ["high", "medium"]'
+
 DEFAULT_RULES: tuple[RatingRule, ...] = (
+    RatingRule(
+        when="highlight_clipped > 0.05",
+        label="yellow",
+        reason="highlights clipped beyond recovery - your call whether that matters",
+    ),
     RatingRule(
         when="max_local_acutance < 12",
         stars=1,
@@ -314,29 +438,44 @@ DEFAULT_RULES: tuple[RatingRule, ...] = (
         reason="nothing in the frame is sharp",
     ),
     RatingRule(
-        when="subject_found and subject_background_ratio is not None and subject_background_ratio < 0.9",
+        when=f"{_INDEPENDENT_SUBJECT} and subject_background_ratio < 0.9",
         stars=2,
         label="yellow",
         reason="background is sharper than the subject - focus missed",
     ),
     RatingRule(
-        when="highlight_clipped > 0.05",
-        stars=2,
-        label="yellow",
-        reason="highlights clipped beyond recovery",
-    ),
-    RatingRule(
-        when="subject_found and subject_background_ratio >= 3 and max_local_acutance >= 25 "
-        "and highlight_clipped <= 0.02",
+        when=f"is_group_best and {_INDEPENDENT_SUBJECT} and subject_background_ratio >= 1.5",
         stars=5,
         label="green",
-        reason="subject clearly sharper than its background, highlights intact",
+        reason="best frame of its group, and focus landed on the subject",
     ),
     RatingRule(
-        when="group_size > 1 and is_group_best",
+        when=f"{_INDEPENDENT_SUBJECT} and subject_background_ratio >= 3",
+        stars=5,
+        label="green",
+        reason="subject clearly sharper than its background",
+    ),
+    RatingRule(
+        when="is_group_best",
         stars=4,
         label="green",
         reason="best frame of its group",
+    ),
+    # The keeper path for a frame that has no near-duplicates to beat. Without
+    # this a unique, well-focused photograph could never reach keepers.txt
+    # except by clearing an absolute acutance bar, which is exactly the
+    # comparison that does not hold across content.
+    RatingRule(
+        when=f"{_INDEPENDENT_SUBJECT} and subject_background_ratio >= 1.5",
+        stars=4,
+        label="green",
+        reason="focus landed on the subject rather than behind it",
+    ),
+    # Lost to a near-duplicate. Not a reject -- just not the one to work on.
+    RatingRule(
+        when="group_size > 1 and not is_group_best",
+        stars=3,
+        reason="a near-duplicate beat this frame",
     ),
     RatingRule(when="max_local_acutance >= 25", stars=3, reason="acceptably sharp somewhere"),
     RatingRule(when="True", stars=2, reason="no rule matched strongly"),

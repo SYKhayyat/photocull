@@ -28,10 +28,16 @@ class DetectionContext:
     """
 
     luma: np.ndarray
-    width: int
-    height: int
     path: str
     directories: tuple[TiffDirectory, ...] = ()
+    # The rotation already applied to ``luma``. Only detectors reading
+    # sensor-space metadata need it -- the autofocus box arrives in the
+    # orientation the file was written in, and has to be turned to match the
+    # pixels before it means anything. The stored pixel dimensions used to live
+    # here too and no detector ever read them: face works off ``luma.shape``,
+    # saliency and zone are normalised throughout, manual and af-point key off
+    # ``path``.
+    orientation: int | None = None
 
 
 @runtime_checkable

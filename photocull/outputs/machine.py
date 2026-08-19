@@ -15,6 +15,7 @@ from xml.sax.saxutils import escape
 
 from ..config import Config
 from ..models import PhotoReport
+from .naming import mirrored_names
 
 # Columns leading the CSV. The rest follow alphabetically, so a new measurement
 # appears automatically instead of being silently dropped from the spreadsheet.
@@ -131,6 +132,12 @@ class XmpWriter:
     Sidecars are written beside the originals only when explicitly enabled, and
     an existing sidecar is never overwritten -- yours may hold develop settings
     representing real work, and no rating is worth destroying that.
+
+    In the report directory the sidecars mirror the source tree rather than
+    landing in one flat folder. Two shoots in one library each holding a
+    ``DSC_0001.NEF`` is the ordinary case, and a flat folder answers it by
+    overwriting the first frame's verdict with the second's while the manifest
+    goes on claiming it wrote both.
     """
 
     name = "xmp"
@@ -159,16 +166,19 @@ class XmpWriter:
         written = 0
         skipped: list[str] = []
 
-        for report in reports:
-            if report.error or report.rating is None:
-                continue
+        rateable = [r for r in reports if not r.error and r.rating is not None]
+        # Computed over the whole set at once, because uniqueness is a property
+        # of the set and cannot be decided one frame at a time.
+        mirrored = mirrored_names([r.path for r in rateable], self.extension)
+
+        for report, relative in zip(rateable, mirrored):
             if beside_originals:
                 target = Path(report.path).with_suffix(Path(report.path).suffix + ".xmp")
                 if target.exists():
                     skipped.append(target.name)
                     continue
             else:
-                target = directory / "xmp" / f"{report.filename}.xmp"
+                target = directory / "xmp" / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
 
             subject = report.sharpness.subject_acutance
@@ -186,7 +196,11 @@ class XmpWriter:
             written += 1
 
         manifest = directory / "xmp-manifest.txt"
+        # Distinct names by construction, so this count is now a fact about the
+        # disk rather than a count of attempts.
         lines = [f"wrote {written} sidecar(s)"]
+        if written and not beside_originals:
+            lines.append("in xmp/, mirroring the folder layout of the originals")
         if skipped:
             lines.append(f"skipped {len(skipped)} existing sidecar(s), none overwritten:")
             lines.extend(f"  {name}" for name in skipped)

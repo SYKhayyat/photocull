@@ -55,6 +55,18 @@ sharp_acutance = 40.0
 # resulting enormous ratio ranks empty frames above real photographs.
 min_background_acutance = 2.0
 
+[exposure]
+# Where the tonal range is read from. dynamic_range is the gap between the
+# percentile-th and (100 - percentile)th brightness, so 0.5 ignores the extreme
+# half-percent at each end -- enough that one hot pixel or a single specular
+# highlight cannot define the range of a whole photograph. Raise it to ignore
+# more; 0 measures true min to max.
+#
+# Clipping is not affected by this and never will be: highlight_clipped and
+# shadow_clipped count pixels at the ends of the range, because that is what
+# clipping means. Both are reported, neither is scored.
+percentile = 0.5
+
 [subject]
 # Detectors in preference order. The first that finds a subject wins, and the
 # report always records which one answered.
@@ -108,48 +120,94 @@ max_time_gap_seconds = 0
 # How frames are ordered inside a group. Any expression over the measurements.
 rank_by = "subject_or_max_acutance"
 
-# Rules are tried in order and the first match wins, so put the specific ones
-# first. Available names are exactly the CSV columns -- run `photocull explain
-# --json` to see them all for a real frame.
+# Rules are tried in order and the first rule that awards stars wins, so put the
+# specific ones first. Available names are exactly the CSV columns -- run
+# `photocull explain --json` to see them all for a real frame.
 #
 # A missing measurement (no subject found, say) compares false rather than
 # raising, so rules stay readable without None guards everywhere.
+#
+# A rule with no `stars` is an annotation: it attaches its label and reason and
+# lets the ladder continue. Use that for things you want flagged but not judged.
+#
+# The defaults deliberately drive the 4- and 5-star verdicts -- the ones that
+# decide keepers.txt, rejects.txt and your XMP star ratings -- off *relative*
+# comparisons: rank within a near-duplicate group, and subject versus background
+# inside one frame. Absolute thresholds across a whole library do not hold; see
+# "What the numbers can and cannot be compared against" in the README.
 
+# Reported, not scored. Clipped highlights are the photographer's call, and a
+# rule set that rejected a backlit portrait over a blown rim light would be
+# overruling the person holding the camera. A rule with no `stars` is an
+# annotation: it flags and steps aside.
+[[rating.rules]]
+when = "highlight_clipped > 0.05"
+label = "yellow"
+reason = "highlights clipped beyond recovery - your call whether that matters"
+
+# The one absolute threshold that survives: "nothing anywhere in this frame is
+# sharp" does not need calibrating against content to be true.
 [[rating.rules]]
 when = "max_local_acutance < 12"
 stars = 1
 label = "red"
 reason = "nothing in the frame is sharp"
 
+# Every rule below that mentions the subject also asks for subject_confidence to
+# be high or medium, and that guard is load-bearing.
+#
+# The saliency detector finds your subject by looking for the region of highest
+# local contrast, which is very nearly what the sharpness map measures. So
+# "is the subject sharper than its background" asked about a saliency box tells
+# you saliency worked, not that focus landed -- it is circular. On a real
+# 835-frame library the median ratio was 3.44 for detected faces and 6.92 for
+# saliency boxes. Only manual boxes, autofocus metadata and detected faces
+# locate a subject independently of sharpness, and only those report high or
+# medium confidence. Frames without one fall through to group rank below, which
+# is independent of all of it.
+#
+# Note also what these rules do NOT use: raw subject_acutance. It is the peak
+# over whichever tiles the subject box covers, so a box spanning half the frame
+# collects a much larger value than a box over someone's eyes, and a threshold
+# on it quietly rates every portrait below every landscape.
 [[rating.rules]]
-when = "subject_found and subject_background_ratio is not None and subject_background_ratio < 0.9"
+when = 'subject_confidence in ["high", "medium"] and subject_background_ratio < 0.9'
 stars = 2
 label = "yellow"
 reason = "background is sharper than the subject - focus missed"
 
 [[rating.rules]]
-when = "highlight_clipped > 0.05"
-stars = 2
-label = "yellow"
-reason = "highlights clipped beyond recovery"
-
-# Note what this rule does NOT use: raw subject_acutance. That number is the
-# peak over whichever tiles the subject box covers, so a saliency box spanning
-# half the frame collects a much larger value than a box over someone's eyes --
-# the two are not comparable, and a threshold on it quietly rates every portrait
-# below every landscape. subject_background_ratio is measured within one frame
-# and does not have that problem.
-[[rating.rules]]
-when = "subject_found and subject_background_ratio >= 3 and max_local_acutance >= 25 and highlight_clipped <= 0.02"
+when = 'is_group_best and subject_confidence in ["high", "medium"] and subject_background_ratio >= 1.5'
 stars = 5
 label = "green"
-reason = "subject clearly sharper than its background, highlights intact"
+reason = "best frame of its group, and focus landed on the subject"
 
 [[rating.rules]]
-when = "group_size > 1 and is_group_best"
+when = 'subject_confidence in ["high", "medium"] and subject_background_ratio >= 3'
+stars = 5
+label = "green"
+reason = "subject clearly sharper than its background"
+
+[[rating.rules]]
+when = "is_group_best"
 stars = 4
 label = "green"
 reason = "best frame of its group"
+
+# The keeper path for a frame with no near-duplicates to beat. Without it a
+# unique, well-focused photograph could only reach keepers.txt by clearing an
+# absolute acutance bar, which is the comparison that does not hold.
+[[rating.rules]]
+when = 'subject_confidence in ["high", "medium"] and subject_background_ratio >= 1.5'
+stars = 4
+label = "green"
+reason = "focus landed on the subject rather than behind it"
+
+# Lost to a near-duplicate. Not a reject -- just not the one to work on.
+[[rating.rules]]
+when = "group_size > 1 and not is_group_best"
+stars = 3
+reason = "a near-duplicate beat this frame"
 
 [[rating.rules]]
 when = "max_local_acutance >= 25"
@@ -174,6 +232,13 @@ include_tile_map = false
 # Write XMP sidecars beside the originals rather than into the report folder.
 # Existing sidecars are never overwritten -- yours may hold real develop work.
 write_xmp_next_to_originals = false
+
+# The contact sheet inlines every thumbnail, so it opens off a USB stick in five
+# years with no server and no asset folder. That is linear in frame count: at
+# ~22 KB apiece, a 5,000-frame wedding is a 113 MB single file. Above this many
+# frames the thumbnails go to a thumbs/ folder beside the page instead, which is
+# still one directory to copy. Raise it if you would rather have the one file.
+self_contained_max_frames = 1500
 
 open_html = false
 '''

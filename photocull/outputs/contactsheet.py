@@ -17,12 +17,16 @@ is a drag and a re-run rather than a feature request.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import quote
 
 from ..config import Config
 from ..models import PhotoReport
+from .naming import indexed_names
 
 _PAYLOAD_TOKEN = "__PHOTOCULL_PAYLOAD__"
 
@@ -150,6 +154,16 @@ const DATA = __PHOTOCULL_PAYLOAD__;
 const manual = {};
 
 const $ = (id) => document.getElementById(id);
+
+// Every string in the payload came off a memory card, and a memory card came
+// from somewhere. json.dumps neutralises "</" so the payload cannot break out
+// of this script block, but card() then reassembles HTML from that payload and
+// hands it to innerHTML -- at which point a filename containing a tag is a tag.
+// The stakes are low, since the page describes your own photographs on your own
+// machine; the fix is free, which settles it.
+const ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+const esc = (value) => String(value === null || value === undefined ? "" : value)
+  .replace(/[&<>"']/g, (character) => ESCAPES[character]);
 const num = (v, digits = 2) => (v === null || v === undefined || Number.isNaN(v))
   ? "\\u2014" : (typeof v === "number" ? v.toFixed(digits) : String(v));
 
@@ -224,15 +238,15 @@ function card(photo) {
     ? `<div class="badge right">group ${photo.group.id} &middot; ${photo.group.rank + 1}/${photo.group.size}</div>` : "";
 
   element.innerHTML = `
-    <div class="frame" data-file="${photo.filename}">
-      ${photo.thumbnail ? `<span class="shot"><img loading="lazy" src="${photo.thumbnail}" alt="">${overlay}${focus}</span>` : ""}
-      <div class="badge">${photo.detection.source}</div>
+    <div class="frame" data-file="${esc(photo.filename)}">
+      ${photo.thumbnail ? `<span class="shot"><img loading="lazy" src="${esc(photo.thumbnail)}" alt="">${overlay}${focus}</span>` : ""}
+      <div class="badge">${esc(photo.detection.source)}</div>
       ${groupBadge}
     </div>
     <div class="meta">
       <div class="stars r${photo.rating ?? 0}">${stars(photo.rating)}</div>
-      <div class="name">${photo.filename}</div>
-      ${photo.error ? `<div class="why" style="color:var(--bad)">${photo.error}</div>` : `
+      <div class="name">${esc(photo.filename)}</div>
+      ${photo.error ? `<div class="why" style="color:var(--bad)">${esc(photo.error)}</div>` : `
       <table class="nums">
         <tr><td>subject</td><td>${num(photo.sharpness.subject_acutance)}</td></tr>
         <tr><td>background</td><td>${num(photo.sharpness.background_acutance)}</td></tr>
@@ -240,10 +254,10 @@ function card(photo) {
         <tr><td>vs frame peak</td><td>${num(photo.sharpness.subject_relative_acutance)}</td></tr>
         <tr><td>peak local</td><td>${num(photo.sharpness.max_local_acutance)}</td></tr>
         <tr><td>in focus</td><td>${num(photo.sharpness.sharp_fraction * 100, 0)}%</td></tr>
-        <tr><td>blur looks like</td><td>${photo.blur.likely_cause}</td></tr>
+        <tr><td>blur looks like</td><td>${esc(photo.blur.likely_cause)}</td></tr>
         <tr><td>clipped</td><td>${num(photo.exposure.highlight_clipped * 100, 1)}%</td></tr>
       </table>
-      <div class="why">${(photo.reasons || []).join(" &middot; ")}</div>`}
+      <div class="why">${(photo.reasons || []).map(esc).join(" &middot; ")}</div>`}
     </div>`;
 
   const frame = element.querySelector(".frame");
@@ -345,7 +359,8 @@ $("summary").innerHTML =
   `<b>${s.analysed}</b> analysed, <b>${s.failed}</b> failed &middot; ` +
   `<b>${s.groups}</b> groups, <b>${s.in_multi_frame_groups}</b> frames have near-duplicates &middot; ` +
   `subject located in <b>${s.subject_found}</b> &middot; ` +
-  `blue box = subject, amber ring = sharpest point`;
+  `blue box = subject, amber ring = sharpest point` +
+  (DATA.note ? ` &middot; <i>${esc(DATA.note)}</i>` : "");
 
 buildDetectorFilter();
 render();
@@ -356,21 +371,71 @@ render();
 
 
 class ContactSheetWriter:
-    """Writes the self-contained HTML review page."""
+    """Writes the HTML review page, self-contained wherever that is sensible.
+
+    Inlining every thumbnail as a data URI is the best property this format has:
+    no server, no asset folder, no broken relative paths, and it still opens in
+    five years off a USB stick. It is also linear in the number of frames, and
+    at roughly 22 KB of base64 apiece a five-thousand-frame wedding is a 113 MB
+    single file. ``loading="lazy"`` defers the decode and does nothing for that:
+    the browser still downloads and parses the whole payload.
+
+    So the page stays one file until it would stop being a sensible one, and
+    above that spills its thumbnails to a sibling folder. What travels is then a
+    directory rather than a file -- still one thing to copy, still no server.
+    """
 
     name = "html"
     extension = ".html"
 
+    _THUMB_DIRECTORY = "thumbs"
+
     def write(self, reports: Sequence[PhotoReport], directory: Path, config: Config) -> Path:
         from ..pipeline import summarise
 
-        payload = {
-            "summary": summarise(reports),
-            "photos": [report.as_dict(include_thumb=True) for report in reports],
-        }
+        photos = [report.as_dict(include_thumb=True) for report in reports]
+        note = self._spill_thumbnails(photos, directory, config)
+
+        payload = {"summary": summarise(reports), "photos": photos, "note": note}
         target = directory / f"contact-sheet{self.extension}"
         # json.dumps output is embedded in a <script> block, so the one sequence
         # that could break out of it has to be neutralised.
         encoded = json.dumps(payload, default=str).replace("</", "<\\/")
         target.write_text(_PAGE.replace(_PAYLOAD_TOKEN, encoded), encoding="utf-8")
         return target
+
+    def _spill_thumbnails(self, photos: list[dict], directory: Path, config: Config) -> str:
+        """Write thumbnails to disk and rewrite their references, above the limit.
+
+        Returns a note for the page header, empty when nothing was spilled. The
+        switch is quiet in the config and loud in the page, which is the right
+        way round: the person who needs to know the folder must travel with the
+        file is the person looking at the file.
+        """
+        with_thumbnails = [entry for entry in photos if entry.get("thumbnail")]
+        if len(with_thumbnails) <= config.output.self_contained_max_frames:
+            return ""
+
+        folder = directory / self._THUMB_DIRECTORY
+        folder.mkdir(parents=True, exist_ok=True)
+        # Indexed, because two folders in one shoot may each hold a DSC_0001.NEF
+        # and a collision would silently show one frame twice. Nothing outside
+        # this page ever reads these names, so an index is the cheapest way to
+        # guarantee they differ -- unlike an XMP sidecar, whose name is the
+        # whole reason the format works.
+        names = indexed_names([str(entry.get("filename", "frame")) for entry in with_thumbnails], ".jpg")
+        for entry, name in zip(with_thumbnails, names):
+            _, _, encoded = str(entry["thumbnail"]).partition(",")
+            try:
+                payload = base64.b64decode(encoded)
+            except (ValueError, binascii.Error):
+                continue  # a thumbnail that will not decode is not worth a crash
+            (folder / name).write_bytes(payload)
+            entry["thumbnail"] = f"{self._THUMB_DIRECTORY}/{quote(name)}"
+
+        return (
+            f"{len(with_thumbnails)} frames, so thumbnails live in "
+            f"{self._THUMB_DIRECTORY}/ beside this file rather than inside it - "
+            "keep the folder together when you move it"
+        )
+
