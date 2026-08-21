@@ -18,6 +18,13 @@ photocull 0.1.0  |  835 file(s)  |  config: built-in defaults
   572 group(s); 373 frame(s) have near-duplicates
 ```
 
+## Documentation
+
+| | |
+| --- | --- |
+| [docs/ONBOARDING.md](docs/ONBOARDING.md) | Install, first run, what the numbers mean and what they may not be compared against, the contact-sheet loop, writing rules — and a tour of the codebase if you are here to change it. |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom-first. Starts with `photocull doctor`, which answers most of it. |
+
 ## Why not just measure sharpness
 
 Because a single sharpness number for a whole photograph is a broken
@@ -361,6 +368,18 @@ photocull doctor            what this machine can actually do
 photocull init              write a commented config file
 photocull fetch-models      download the optional face model, once
 ```
+
+
+## Troubleshooting
+
+Start with `photocull doctor`, which reports which optional capabilities are
+live here and why each missing one is missing, and `photocull explain FILE`,
+which prints every measurement and the verdict for one frame.
+
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) covers the rest: files that
+will not open, subject boxes on the wrong thing, numbers that look too good
+because saliency found the subject, ratings that favour landscapes, config
+errors, report sizes, and speed.
 
 ## Licence
 
