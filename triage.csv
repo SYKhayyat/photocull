@@ -1,0 +1,5 @@
+number,title,url,D,R,why,risk
+1,[Medium/bug] compare path-fallback never fires moves report zero,https://github.com/SYKhayyat/photocull/issues/1,1,4,Index both keys; moves silently report zero,Silent zero moves
+2,[Medium/bug] Bad-arity rule fn crashes mid-run not config-load,https://github.com/SYKhayyat/photocull/issues/2,2,3,Arity check at load; mid-run crash is visible,Visible mid-run crash
+3,[Low/bug] Non-bool TOML coerced with bool(),https://github.com/SYKhayyat/photocull/issues/3,1,4,isinstance check; recursive=no silently becomes True,Silent wrong True
+4,[Low/bug] explain nonsense shutter for >=1s,https://github.com/SYKhayyat/photocull/issues/4,1,2,Show seconds >=1s; wrong 1/0s label only,Wrong label only
